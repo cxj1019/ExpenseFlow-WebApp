@@ -3,20 +3,24 @@
 'use client'
 
 import { createClientComponentClient } from '@supabase/auth-helpers-nextjs'
-import { useEffect, useState, FormEvent, ChangeEvent, useRef } from 'react'
+import { useEffect, useState, FormEvent, ChangeEvent, useRef, useCallback } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import type { Database } from '@/types/database.types'
 import type { User } from '@supabase/supabase-js'
-// 导入 pinyin-pro 库，用于汉字转拼音及首字母搜索
 import { pinyin } from 'pinyin-pro';
 
 // --- 类型定义 ---
 type Report = Database['public']['Tables']['reports']['Row']
 type Expense = Database['public']['Tables']['expenses']['Row']
 type Customer = Database['public']['Tables']['customers']['Row']
+type Profile = Database['public']['Tables']['profiles']['Row']
 type CostCenter = Database['public']['Tables']['cost_centers']['Row']
 type SearchableOption = { id: number | string; name: string | null };
+
+type ReportWithSubmitter = Report & {
+  profiles: Profile | null;
+};
 
 type ReportDetailPageProps = {
   params: {
@@ -24,13 +28,209 @@ type ReportDetailPageProps = {
   }
 }
 
-// 预设的费用类型
 const EXPENSE_CATEGORIES = ['飞机', '火车', '长途汽车', 'Taxi', '餐饮', '住宿', '办公用品', '客户招待', '员工福利', '其他'];
 
+// ====================================================================
+//  最终版图片预览组件 (悬停触发、可固定、全功能交互)
+// ====================================================================
+const ImagePreview = ({ src, children }: { src: string; children: React.ReactNode }) => {
+  const [isVisible, setIsVisible] = useState(false);
+  const [scale, setScale] = useState(1);
+  const [rotation, setRotation] = useState(0);
+  const [windowPosition, setWindowPosition] = useState({ x: 0, y: 0 });
+  const [windowSize, setWindowSize] = useState({ width: 500, height: 600 });
+  const [imageOffset, setImageOffset] = useState({ x: 0, y: 0 });
+  
+  const [isWindowDragging, setIsWindowDragging] = useState(false);
+  const [isImageDragging, setIsImageDragging] = useState(false);
+  const [isResizing, setIsResizing] = useState(false);
+  
+  const dragStart = useRef({ x: 0, y: 0 });
+  const initialSize = useRef({ width: 0, height: 0 });
+  const previewRef = useRef<HTMLDivElement>(null);
+  const hideTimeout = useRef<NodeJS.Timeout | null>(null);
 
-// ====================================================================
-//  新增：可搜索、支持拼音首字母的下拉选择组件
-// ====================================================================
+  const handleMouseEnter = () => {
+    if (hideTimeout.current) clearTimeout(hideTimeout.current);
+    if (!isVisible) {
+      const initialX = window.innerWidth / 2 - windowSize.width / 2;
+      const initialY = window.innerHeight / 2 - windowSize.height / 2;
+      setWindowPosition({ x: initialX > 0 ? initialX : 0, y: initialY > 0 ? initialY : 0 });
+      setScale(1);
+      setRotation(0);
+      setImageOffset({ x: 0, y: 0 });
+    }
+    setIsVisible(true);
+  };
+
+  const handleMouseLeave = () => {
+    if (!isWindowDragging && !isImageDragging && !isResizing) {
+      hideTimeout.current = setTimeout(() => {
+        setIsVisible(false);
+      }, 300);
+    }
+  };
+
+  const cancelHide = () => {
+    if (hideTimeout.current) clearTimeout(hideTimeout.current);
+  };
+
+  const handleClose = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setIsVisible(false);
+  };
+  
+  const handleZoomIn = useCallback(() => setScale(s => s * 1.2), []);
+  const handleZoomOut = useCallback(() => {
+    setScale(s => {
+      const newScale = s / 1.2;
+      if (newScale <= 1) {
+        setImageOffset({ x: 0, y: 0 });
+        return 1;
+      }
+      return newScale;
+    });
+  }, []);
+  const handleRotate = () => setRotation(r => (r + 90) % 360);
+
+  const onWindowDragStart = (e: React.MouseEvent<HTMLDivElement>) => {
+    if ((e.target as HTMLElement).dataset.resizeHandle || (e.target as HTMLElement).dataset.closeButton) return;
+    e.preventDefault();
+    setIsWindowDragging(true);
+    dragStart.current = { x: e.clientX - windowPosition.x, y: e.clientY - windowPosition.y };
+  };
+
+  const onImageDragStart = (e: React.MouseEvent<HTMLImageElement>) => {
+    if (scale <= 1) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setIsImageDragging(true);
+    dragStart.current = { x: e.clientX - imageOffset.x, y: e.clientY - imageOffset.y };
+  };
+
+  const onResizeStart = (e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsResizing(true);
+    dragStart.current = { x: e.clientX, y: e.clientY };
+    if (previewRef.current) {
+      initialSize.current = { width: previewRef.current.offsetWidth, height: previewRef.current.offsetHeight };
+    }
+  };
+
+  const onMouseMove = useCallback((e: MouseEvent) => {
+    if (isWindowDragging) {
+      setWindowPosition({ x: e.clientX - dragStart.current.x, y: e.clientY - dragStart.current.y });
+    } else if (isImageDragging) {
+      setImageOffset({ x: e.clientX - dragStart.current.x, y: e.clientY - dragStart.current.y });
+    } else if (isResizing) {
+      const dx = e.clientX - dragStart.current.x;
+      const dy = e.clientY - dragStart.current.y;
+      setWindowSize({ width: initialSize.current.width + dx, height: initialSize.current.height + dy });
+    }
+  }, [isWindowDragging, isImageDragging, isResizing]);
+
+  const onMouseUp = useCallback(() => {
+    setIsWindowDragging(false);
+    setIsImageDragging(false);
+    setIsResizing(false);
+  }, []);
+
+  useEffect(() => {
+    if (isWindowDragging || isImageDragging || isResizing) {
+      document.addEventListener('mousemove', onMouseMove);
+      document.addEventListener('mouseup', onMouseUp);
+    }
+    return () => {
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+    };
+  }, [isWindowDragging, isImageDragging, isResizing, onMouseMove, onMouseUp]);
+
+  useEffect(() => {
+    const previewElement = previewRef.current;
+    if (!isVisible || !previewElement) return;
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      if (e.deltaY < 0) handleZoomIn();
+      else handleZoomOut();
+    };
+    previewElement.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      if (previewElement) previewElement.removeEventListener('wheel', handleWheel);
+    };
+  }, [isVisible, handleZoomIn, handleZoomOut]);
+
+  return (
+    <div onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave} className="inline-block">
+      {children}
+      {isVisible && (
+        <div
+          ref={previewRef}
+          onMouseEnter={cancelHide}
+          className="fixed p-2 bg-white rounded-lg shadow-2xl z-50 flex flex-col"
+          style={{
+            top: windowPosition.y,
+            left: windowPosition.x,
+            width: `${windowSize.width}px`,
+            height: `${windowSize.height}px`,
+            minWidth: '250px',
+            minHeight: '250px',
+          }}
+        >
+          <div
+            onMouseDown={onWindowDragStart}
+            className="w-full h-6 bg-gray-100 rounded-t-md mb-2 flex-shrink-0 relative"
+            style={{ cursor: isWindowDragging ? 'grabbing' : 'grab' }}
+          >
+            <button
+              data-close-button="true"
+              onClick={handleClose}
+              className="absolute top-0 right-0 p-1 text-gray-500 hover:text-gray-800 hover:bg-gray-200 rounded-full"
+              style={{ lineHeight: '1rem', height: '1.5rem', width: '1.5rem' }}
+              title="关闭"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+          <div className="overflow-hidden flex-grow relative">
+            <img
+              onMouseDown={onImageDragStart}
+              src={src}
+              alt="发票预览"
+              className="absolute top-0 left-0 transition-transform duration-200"
+              style={{
+                width: '100%',
+                height: '100%',
+                objectFit: 'contain',
+                transform: `translateX(${imageOffset.x}px) translateY(${imageOffset.y}px) scale(${scale}) rotate(${rotation}deg)`,
+                cursor: scale > 1 ? (isImageDragging ? 'grabbing' : 'grab') : 'default',
+                pointerEvents: 'all',
+              }}
+            />
+          </div>
+          <div className="mt-2 flex justify-center items-center space-x-2 bg-gray-50 p-1 rounded-b-md flex-shrink-0">
+            <button onClick={() => handleZoomOut()} title="缩小" className="p-1.5 text-gray-600 rounded hover:bg-gray-200"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM13 10H7" /></svg></button>
+            <button onClick={() => handleZoomIn()} title="放大" className="p-1.5 text-gray-600 rounded hover:bg-gray-200"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v6m3-3H7" /></svg></button>
+            <button onClick={handleRotate} title="旋转" className="p-1.5 text-gray-600 rounded hover:bg-gray-200"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h5M5.5 9.5a9 9 0 109 9" /></svg></button>
+          </div>
+          <div
+            data-resize-handle="true"
+            onMouseDown={onResizeStart}
+            className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize"
+          >
+             <div className="w-full h-full border-r-2 border-b-2 border-gray-400 opacity-50"></div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+
+// 可搜索选择组件
 type SearchableSelectProps = {
   options: SearchableOption[];
   value: string;
@@ -86,11 +286,7 @@ const SearchableSelect = ({ options, value, onChange, placeholder }: SearchableS
         <ul className="absolute z-10 w-full bg-white border border-gray-300 rounded-md mt-1 max-h-60 overflow-y-auto shadow-lg">
           {filteredOptions.length > 0 ? (
             filteredOptions.map(option => (
-              <li
-                key={option.id}
-                onClick={() => handleSelect(option.name || '')}
-                className="px-3 py-2 cursor-pointer hover:bg-gray-100"
-              >
+              <li key={option.id} onClick={() => handleSelect(option.name || '')} className="px-3 py-2 cursor-pointer hover:bg-gray-100">
                 {option.name}
               </li>
             ))
@@ -105,128 +301,123 @@ const SearchableSelect = ({ options, value, onChange, placeholder }: SearchableS
 
 
 export default function ReportDetailPage({ params }: ReportDetailPageProps) {
-  const [report, setReport] = useState<Report | null>(null)
-  const [expenses, setExpenses] = useState<Expense[]>([])
-  const [user, setUser] = useState<User | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [report, setReport] = useState<ReportWithSubmitter | null>(null);
+  const [expenses, setExpenses] = useState<Expense[]>([]);
+  const [user, setUser] = useState<User | null>(null);
+  const [currentUserProfile, setCurrentUserProfile] = useState<Profile | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [signedUrls, setSignedUrls] = useState<Record<string, string[]>>({});
-  
   const [customers, setCustomers] = useState<Customer[]>([]);
-  const [costCenters, setCostCenters] = useState<CostCenter[]>([]);
-
-  // 表单状态
   const [category, setCategory] = useState(EXPENSE_CATEGORIES[0]);
-  const [costCenter, setCostCenter] = useState(''); 
-  const [amount, setAmount] = useState('')
-  const [expenseDate, setExpenseDate] = useState(new Date().toISOString().split('T')[0])
+  const [amount, setAmount] = useState('');
+  const [expenseDate, setExpenseDate] = useState(new Date().toISOString().split('T')[0]);
   const [description, setDescription] = useState('');
-  const [receiptFiles, setReceiptFiles] = useState<FileList | null>(null)
+  const [receiptFiles, setReceiptFiles] = useState<FileList | null>(null);
   const [isVatInvoice, setIsVatInvoice] = useState(false);
   const [taxRate, setTaxRate] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
-
   const [reportCustomerName, setReportCustomerName] = useState('');
   const [reportBillToCustomer, setReportBillToCustomer] = useState(false);
 
-  const supabase = createClientComponentClient<Database>()
+  const supabase = createClientComponentClient<Database>();
   const router = useRouter();
-  const reportId = params.id
+  const reportId = params.id;
 
-  const generateSignedUrls = async (expensesToProcess: Expense[]) => {
+  const generateSignedUrls = useCallback(async (expensesToProcess: Expense[]) => {
     const urls: Record<string, string[]> = {};
     for (const expense of expensesToProcess) {
       if (expense.receipt_urls && expense.receipt_urls.length > 0) {
         const expenseUrls: string[] = [];
         for (const path of expense.receipt_urls) {
-          const { data } = await supabase.storage.from('receipts').createSignedUrl(path, 60);
+          const { data } = await supabase.storage.from('receipts').createSignedUrl(path, 60 * 60);
           if (data) { expenseUrls.push(data.signedUrl); }
         }
         urls[expense.id] = expenseUrls;
       }
     }
     setSignedUrls(urls);
-  }
+  }, [supabase]);
 
-  const fetchPageData = async () => {
+  const fetchPageData = useCallback(async () => {
+    setLoading(true);
     const { data: { user } } = await supabase.auth.getUser();
     setUser(user);
+    if (!user) {
+      setLoading(false);
+      router.push('/');
+      return;
+    }
 
-    const [reportRes, expensesRes, customersRes, costCentersRes] = await Promise.all([
-      supabase.from('reports').select('*').eq('id', parseInt(reportId, 10)).single(),
+    const [reportRes, expensesRes, customersRes, profileRes] = await Promise.all([
+      supabase.from('reports').select('*, profiles!user_id(*)').eq('id', parseInt(reportId, 10)).single(),
       supabase.from('expenses').select('*').eq('report_id', parseInt(reportId, 10)).order('expense_date', { ascending: false }),
       supabase.from('customers').select('*').order('name', { ascending: true }),
-      supabase.from('cost_centers').select('*').order('name', { ascending: true })
+      supabase.from('profiles').select('*').eq('id', user.id).single(),
     ]);
 
+    setCurrentUserProfile(profileRes.data);
+
     const { data: reportData, error: reportError } = reportRes;
-    if (reportError || !reportData) { setError('无法加载报销单，或您无权访问。'); setReport(null); return }
-    setReport(reportData)
+    if (reportError || !reportData) {
+      setError('无法加载报销单，或您无权访问。');
+      setReport(null);
+      setLoading(false);
+      return;
+    }
+    setReport(reportData as ReportWithSubmitter);
     setReportCustomerName(reportData.customer_name || '');
     setReportBillToCustomer(reportData.bill_to_customer || false);
-    
+
     const { data: expensesData, error: expensesError } = expensesRes;
-    if (expensesError) { setError('加载费用列表失败。') } 
-    else { setExpenses(expensesData); await generateSignedUrls(expensesData) }
+    if (expensesError) {
+      setError('加载费用列表失败。');
+    } else {
+      setExpenses(expensesData);
+      await generateSignedUrls(expensesData);
+    }
 
     setCustomers(customersRes.data || []);
-    const fetchedCostCenters = costCentersRes.data || [];
-    setCostCenters(fetchedCostCenters);
-
-    if (fetchedCostCenters.length > 0 && fetchedCostCenters[0].name) {
-      if (!costCenter) { // 仅在尚未选择时设置默认值
-        setCostCenter(fetchedCostCenters[0].name);
-      }
-    }
-  }
+    setLoading(false);
+  }, [reportId, supabase, router, generateSignedUrls]);
 
   useEffect(() => {
-    setLoading(true)
-    fetchPageData().finally(() => setLoading(false))
-  }, [])
+    fetchPageData();
+  }, [fetchPageData]);
 
   useEffect(() => {
     if (category === '飞机' || category === '火车') {
-      setIsVatInvoice(true);
-      setTaxRate('9');
+      setIsVatInvoice(true); setTaxRate('9');
     } else {
-      setIsVatInvoice(false);
-      setTaxRate('');
+      setIsVatInvoice(false); setTaxRate('');
     }
   }, [category]);
 
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
     setReceiptFiles(e.target.files);
-  }
+  };
 
   const handleAddExpense = async (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault()
-    if (!user) return
-    if (!costCenter) { alert('请选择一个成本中心！'); return; }
+    e.preventDefault();
+    if (!user) return;
 
-    const parsedAmount = parseFloat(amount)
-    if (isNaN(parsedAmount)) { alert('请输入有效的金额！'); return }
+    const parsedAmount = parseFloat(amount);
+    if (isNaN(parsedAmount)) { alert('请输入有效的金额！'); return; }
 
     let parsedTaxRate = null;
     if (isVatInvoice) {
-      if (taxRate.trim() === '') {
-        alert('选择了增值税专用发票，必须填写税率！');
-        return;
-      }
+      if (taxRate.trim() === '') { alert('选择了增值税专用发票，必须填写税率！'); return; }
       parsedTaxRate = parseFloat(taxRate);
-      if (isNaN(parsedTaxRate)) {
-        alert('请输入有效的税率！');
-        return;
-      }
+      if (isNaN(parsedTaxRate)) { alert('请输入有效的税率！'); return; }
     }
 
-    setIsProcessing(true)
+    setIsProcessing(true);
     const receiptPaths: string[] = [];
 
     if (receiptFiles && receiptFiles.length > 0) {
       for (const file of Array.from(receiptFiles)) {
-        const fileExt = file.name.split('.').pop()
-        const fileName = `${user.id}-${Date.now()}-${Math.random()}.${fileExt}`
+        const fileExt = file.name.split('.').pop();
+        const fileName = `${user.id}-${Date.now()}-${Math.random()}.${fileExt}`;
         const { error: uploadError } = await supabase.storage.from('receipts').upload(fileName, file);
         if (uploadError) {
           alert(`上传文件 ${file.name} 失败: ${uploadError.message}`);
@@ -241,22 +432,18 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
       report_id: parseInt(reportId, 10),
       user_id: user.id,
       category,
-      cost_center: costCenter,
       amount: parsedAmount,
       expense_date: expenseDate,
       description: description.trim() === '' ? null : description.trim(),
       receipt_urls: receiptPaths.length > 0 ? receiptPaths : null,
       is_vat_invoice: isVatInvoice,
       tax_rate: parsedTaxRate,
-    })
+    });
 
     if (insertError) {
-      alert('添加费用失败: ' + insertError.message)
+      alert('添加费用失败: ' + insertError.message);
     } else {
       setCategory(EXPENSE_CATEGORIES[0]);
-      if (costCenters.length > 0 && costCenters[0].name) {
-        setCostCenter(costCenters[0].name);
-      }
       setAmount('');
       setDescription('');
       setReceiptFiles(null);
@@ -265,10 +452,10 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
       const fileInput = document.getElementById('receipt') as HTMLInputElement;
       if (fileInput) fileInput.value = "";
       
-      await fetchPageData()
+      await fetchPageData();
     }
-    setIsProcessing(false)
-  }
+    setIsProcessing(false);
+  };
 
   const handleUpdateReportCustomerInfo = async () => {
     setIsProcessing(true);
@@ -285,7 +472,7 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
     if (error) {
       alert('更新客户信息失败: ' + error.message);
     } else {
-      setReport(data);
+      setReport(data as ReportWithSubmitter);
       alert('客户信息已更新！');
     }
     setIsProcessing(false);
@@ -310,7 +497,7 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
     if (!['submitted', 'pending_partner_approval'].includes(report.status)) { alert('此状态下的报销单无法撤回。'); return; }
     setIsProcessing(true);
     const { data, error } = await supabase.from('reports').update({ status: 'draft' }).eq('id', parseInt(reportId, 10)).select().single();
-    if (error) { alert('撤回失败: ' + error.message); } else { setReport(data); alert('报销单已成功撤回，您可以继续编辑。'); }
+    if (error) { alert('撤回失败: ' + error.message); } else { setReport(data as ReportWithSubmitter); alert('报销单已成功撤回，您可以继续编辑。'); }
     setIsProcessing(false);
   };
   
@@ -319,9 +506,9 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
     if (expenses.length === 0) { alert('报销单中没有任何费用，无法提交。'); return; }
     setIsProcessing(true);
     const { data, error } = await supabase.from('reports').update({ status: 'submitted', submitted_at: new Date().toISOString() }).eq('id', parseInt(reportId, 10)).select().single();
-    if (error) { alert('提交失败: ' + error.message); } else { setReport(data); alert('报销单已成功提交！'); }
+    if (error) { alert('提交失败: ' + error.message); } else { setReport(data as ReportWithSubmitter); alert('报销单已成功提交！'); }
     setIsProcessing(false);
-  }
+  };
 
   const handleDeleteReport = async () => {
     if (!report || !user || user.id !== report.user_id || report.status !== 'draft') { alert('只有您自己的、且处于草稿状态的报销单才能被删除。'); return; }
@@ -338,23 +525,85 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
     router.push('/dashboard');
   };
 
-  if (loading) return <div className="flex justify-center items-center min-h-screen">正在加载详情...</div>
-  if (error) return <div className="flex justify-center items-center min-h-screen text-red-500">{error}</div>
+  const handleApprovalDecision = async (decision: 'approved' | 'send_back') => {
+    if (!report || !currentUserProfile) return;
+    setIsProcessing(true);
 
+    let newStatus: Report['status'];
+    const updatePayload: Partial<Report> = {};
+
+    if (decision === 'send_back') {
+        newStatus = 'draft';
+        updatePayload.status = newStatus;
+    } else { // approved
+        const totalAmount = report.total_amount || 0;
+        if (
+            totalAmount > 5000 &&
+            (currentUserProfile.role === 'manager' || currentUserProfile.role === 'admin') &&
+            report.status === 'submitted'
+        ) {
+            newStatus = 'pending_partner_approval';
+        } else {
+            newStatus = 'approved';
+        }
+        updatePayload.status = newStatus;
+        updatePayload.approver_id = currentUserProfile.id;
+        updatePayload.approved_at = new Date().toISOString();
+    }
+
+    const { data, error } = await supabase
+      .from('reports')
+      .update(updatePayload)
+      .eq('id', report.id)
+      .select()
+      .single();
+
+    if (error) {
+      alert(`操作失败: ${error.message}`);
+    } else {
+      setReport(data as ReportWithSubmitter);
+      alert(decision === 'send_back' ? '报销单已退回修改。' : '操作成功！');
+    }
+    setIsProcessing(false);
+  };
+  
   const isOwner = user?.id === report?.user_id;
   const isDraft = report?.status === 'draft';
   const canWithdraw = isOwner && ['submitted', 'pending_partner_approval'].includes(report?.status || '');
+
+  const canApprove = 
+    report &&
+    currentUserProfile &&
+    !isOwner && (
+      ( (currentUserProfile.role === 'manager' || currentUserProfile.role === 'admin') && report.status === 'submitted' ) ||
+      ( currentUserProfile.role === 'partner' && (report.status === 'submitted' || report.status === 'pending_partner_approval') )
+    );
+
+  if (loading) return <div className="flex justify-center items-center min-h-screen">正在加载详情...</div>;
+  if (error) return <div className="flex justify-center items-center min-h-screen text-red-500">{error}</div>;
 
   return (
     <div className="min-h-screen bg-gray-100">
       <header className="bg-white shadow-sm">
         <div className="container mx-auto px-6 py-4 flex justify-between items-start flex-wrap gap-4">
           <div>
-            <Link href="/dashboard" className="text-blue-600 hover:underline">&larr; 返回仪表盘</Link>
+            {/* 【已修改】动态返回按钮 */}
+            <Link href={canApprove ? "/approval" : "/dashboard"} className="text-blue-600 hover:underline">
+              &larr; {canApprove ? "返回审批中心" : "返回仪表盘"}
+            </Link>
             <h1 className="text-3xl font-bold text-gray-800 mt-2">{report?.title}</h1>
-            <p className="text-gray-500">状态: <span className="font-semibold">{report?.status}</span></p>
+            <p className="text-gray-500">
+              状态: <span className="font-semibold">{report?.status}</span>
+              <span className="ml-4">提交人: {report?.profiles?.full_name || 'N/A'}</span>
+            </p>
           </div>
           <div className="flex items-center space-x-2">
+            {canApprove && (
+              <>
+                <button onClick={() => handleApprovalDecision('approved')} disabled={isProcessing} className="px-4 py-2 font-semibold text-white bg-green-600 rounded-lg hover:bg-green-700 disabled:bg-gray-400">批准</button>
+                <button onClick={() => handleApprovalDecision('send_back')} disabled={isProcessing} className="px-4 py-2 font-semibold text-white bg-gray-600 rounded-lg hover:bg-gray-700 disabled:bg-gray-400">退回修改</button>
+              </>
+            )}
             {canWithdraw && (<button onClick={handleWithdrawReport} disabled={isProcessing} className="px-4 py-2 font-semibold text-white bg-yellow-600 rounded-lg hover:bg-yellow-700 disabled:bg-gray-400"> {isProcessing ? '处理中...' : '撤回'} </button>)}
             {isOwner && isDraft && (
               <>
@@ -374,7 +623,6 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
               <div className="space-y-4">
                 <div>
                   <label htmlFor="reportCustomerName" className="block text-sm font-medium text-gray-700">客户名称</label>
-                  {/* -- 修改点: 使用新的 SearchableSelect 组件 -- */}
                   <SearchableSelect
                     placeholder="搜索客户名称或拼音"
                     options={customers}
@@ -396,16 +644,6 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
               <h2 className="text-2xl font-bold mb-4">添加一笔费用</h2>
               <form onSubmit={handleAddExpense} className="space-y-4">
                 <div><label htmlFor="category" className="block text-sm font-medium text-gray-700">费用类型</label><select id="category" value={category} onChange={e => setCategory(e.target.value)} required className="mt-1 block w-full px-3 py-2 border border-gray-300 bg-white rounded-md shadow-sm">{EXPENSE_CATEGORIES.map(cat => <option key={cat} value={cat}>{cat}</option>)}</select></div>
-                <div>
-                  <label htmlFor="costCenter" className="block text-sm font-medium text-gray-700">成本中心</label>
-                   {/* -- 修改点: 使用新的 SearchableSelect 组件 -- */}
-                  <SearchableSelect
-                    placeholder="搜索成本中心或拼音"
-                    options={costCenters}
-                    value={costCenter}
-                    onChange={setCostCenter}
-                  />
-                </div>
                 <div><label htmlFor="amount" className="block text-sm font-medium text-gray-700">金额</label><input type="number" id="amount" value={amount} onChange={e => setAmount(e.target.value)} required step="0.01" className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm"/></div>
                 <div><label htmlFor="expenseDate" className="block text-sm font-medium text-gray-700">消费日期</label><input type="date" id="expenseDate" value={expenseDate} onChange={e => setExpenseDate(e.target.value)} required className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm"/></div>
                 <div><label htmlFor="description" className="block text-sm font-medium text-gray-700">备注 (可选)</label><textarea id="description" value={description} onChange={e => setDescription(e.target.value)} rows={2} className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm"></textarea></div>
@@ -435,7 +673,6 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
                   <div className="flex justify-between items-start">
                     <div>
                       <p className="font-bold">{expense.category}</p>
-                      {expense.cost_center && <p className="text-sm text-gray-600">成本中心: {expense.cost_center}</p>}
                       {expense.description && <p className="text-sm text-gray-500 italic">"{expense.description}"</p>}
                       <p className="text-sm text-gray-500">{new Date(expense.expense_date!).toLocaleDateString()}</p>
                       {expense.is_vat_invoice && <p className="text-xs font-semibold text-purple-600">专票 (税率: {expense.tax_rate}%)</p>}
@@ -447,7 +684,18 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
                   </div>
                   {expense.receipt_urls && expense.receipt_urls.length > 0 && (
                     <div className="mt-2 pt-2 border-t flex flex-wrap gap-2">
-                      {signedUrls[expense.id]?.map((url, index) => (<a key={url} href={url} target="_blank" rel="noopener noreferrer" className="text-sm text-blue-500 hover:underline"> 发票{index + 1} </a>))}
+                      {signedUrls[expense.id]?.map((url, index) => (
+                        <ImagePreview key={url} src={url}>
+                          <a
+                            href={url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-sm text-blue-500 hover:underline"
+                          >
+                            发票{index + 1}
+                          </a>
+                        </ImagePreview>
+                      ))}
                     </div>
                   )}
                 </div>
@@ -457,5 +705,5 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
         </div>
       </main>
     </div>
-  )
+  );
 }

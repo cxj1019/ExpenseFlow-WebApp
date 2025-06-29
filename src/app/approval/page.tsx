@@ -10,10 +10,8 @@ import type { Database } from '@/types/database.types'
 
 type Profile = Database['public']['Tables']['profiles']['Row']
 type Expense = Database['public']['Tables']['expenses']['Row']
-// 【新增】明确定义 Report 类型
 type Report = Database['public']['Tables']['reports']['Row']
 type ReportWithProfile = Report & {
-  // 【已修正】明确指出这个 profiles 是通过 user_id 关联的创建人
   profiles: Profile | null
   expenses: Expense[]
 }
@@ -27,17 +25,16 @@ export default function ApprovalPage() {
   const supabase = createClientComponentClient<Database>()
 
   const fetchReports = async (userRole: string, userId: string) => {
-    // 【已修正】明确指定关联关系：profiles!user_id(*) 来获取提交人信息
     const baseSelect = '*, profiles!user_id(*), expenses(*)'
     
     // 获取待处理报销单
     const pendingQuery = supabase
       .from('reports')
       .select(baseSelect)
-      .neq('user_id', userId) // 核心：不能是自己的报销单
+      .neq('user_id', userId) 
       .order('submitted_at', { ascending: true });
 
-    if (userRole === 'manager') {
+    if (userRole === 'manager' || userRole === 'admin') {
       pendingQuery.eq('status', 'submitted');
     } else if (userRole === 'partner') {
       pendingQuery.in('status', ['submitted', 'pending_partner_approval']);
@@ -54,6 +51,7 @@ export default function ApprovalPage() {
     const { data: processedData, error: processedError } = await supabase
       .from('reports')
       .select(baseSelect)
+      .eq('approver_id', userId) // 只看自己处理过的
       .in('status', ['approved', 'rejected'])
       .order('approved_at', { ascending: false, nullsFirst: false })
       .limit(20);
@@ -71,7 +69,7 @@ export default function ApprovalPage() {
       if (!user) { router.push('/'); return; }
 
       const { data: profileData } = await supabase.from('profiles').select('*').eq('id', user.id).single();
-      if (!profileData || !['manager', 'partner'].includes(profileData.role)) {
+      if (!profileData || !['manager', 'partner', 'admin'].includes(profileData.role)) {
         setProfile(profileData);
         setLoading(false);
         return;
@@ -83,54 +81,8 @@ export default function ApprovalPage() {
     checkRoleAndFetchData();
   }, [supabase, router]);
 
-  const handleDecision = async (report: ReportWithProfile, decision: 'approved' | 'rejected' | 'send_back') => {
-    if (!profile) return;
-
-    let newStatus: Report['status'];
-    // 【已修正】确保 updatePayload 的类型是正确的 Partial<Report>
-    const updatePayload: Partial<Report> = {};
-
-    if (decision === 'send_back') {
-        newStatus = 'draft';
-        updatePayload.status = newStatus;
-    } else {
-        const totalAmount = report.total_amount || 0;
-        if (
-            decision === 'approved' &&
-            totalAmount > 5000 &&
-            profile.role === 'manager' &&
-            report.status === 'submitted'
-        ) {
-            newStatus = 'pending_partner_approval';
-        } else {
-            newStatus = decision;
-        }
-        updatePayload.status = newStatus;
-        if (newStatus === 'approved') {
-            updatePayload.approved_at = new Date().toISOString();
-            updatePayload.approver_id = profile.id;
-        }
-    }
-
-    const { error } = await supabase
-      .from('reports')
-      .update(updatePayload)
-      .eq('id', report.id);
-
-    if (error) {
-      alert(`操作失败: ${error.message}`);
-    } else {
-      alert(decision === 'send_back' ? '报销单已退回修改。' : '操作成功！');
-      setPendingReports(pendingReports.filter(r => r.id !== report.id));
-      if (decision !== 'send_back') {
-        const updatedReport = { ...report, status: newStatus };
-        setProcessedReports([updatedReport, ...processedReports]);
-      }
-    }
-  };
-
   if (loading) return <div className="flex justify-center items-center min-h-screen">正在加载...</div>;
-  if (!profile || !['manager', 'partner'].includes(profile.role)) {
+  if (!profile || !['manager', 'partner', 'admin'].includes(profile.role)) {
     return (
       <div className="flex flex-col justify-center items-center min-h-screen text-center">
         <h1 className="text-3xl font-bold text-red-600">访问被拒绝</h1>
@@ -156,22 +108,20 @@ export default function ApprovalPage() {
             {pendingReports.length > 0 ? (
               <div className="space-y-4">
                 {pendingReports.map(report => (
-                  <div key={report.id} className="p-4 border rounded-lg">
-                    <p className="font-bold text-lg">{report.title}</p>
-                    <div className="text-sm text-gray-600 my-2">
-                      <p>提交人: {report.profiles?.full_name || 'N/A'} ({report.profiles?.role})</p>
-                      <p>总金额: <span className="font-mono">¥{report.total_amount?.toFixed(2) || '0.00'}</span></p>
-                      {report.status === 'pending_partner_approval' && <p className="text-orange-500 font-bold">需合伙人终审</p>}
-                    </div>
-                    <div className="flex justify-between items-center mt-2">
-                      <Link href={`/dashboard/report/${report.id}`} className="text-blue-600 hover:underline">查看详情</Link>
-                      <div className="flex space-x-2">
-                        <button onClick={() => handleDecision(report, 'approved')} className="px-3 py-1 bg-green-500 text-white text-sm rounded hover:bg-green-600">批准</button>
-                        <button onClick={() => handleDecision(report, 'rejected')} className="px-3 py-1 bg-red-500 text-white text-sm rounded hover:bg-red-600">拒绝</button>
-                        <button onClick={() => handleDecision(report, 'send_back')} className="px-3 py-1 bg-gray-500 text-white text-sm rounded hover:bg-gray-600">退回修改</button>
+                  <Link href={`/dashboard/report/${report.id}`} key={report.id}>
+                    <div className="p-4 border rounded-lg hover:bg-gray-50 cursor-pointer">
+                      <p className="font-bold text-lg">{report.title}</p>
+                      <div className="text-sm text-gray-600 my-2">
+                        {/* 【已修改】移除角色显示 */}
+                        <p>提交人: {report.profiles?.full_name || 'N/A'}</p>
+                        <p>总金额: <span className="font-mono">¥{report.total_amount?.toFixed(2) || '0.00'}</span></p>
+                        {report.status === 'pending_partner_approval' && <p className="text-orange-500 font-bold">需合伙人终审</p>}
+                      </div>
+                      <div className="flex justify-end items-center mt-2">
+                        <span className="text-blue-600 hover:underline">前往审批 &rarr;</span>
                       </div>
                     </div>
-                  </div>
+                  </Link>
                 ))}
               </div>
             ) : <p className="text-gray-500">当前没有待您审批的报销单。</p>}
@@ -180,7 +130,7 @@ export default function ApprovalPage() {
         {/* 已审批历史 */}
         <section>
           <div className="bg-white p-6 rounded-lg shadow-md">
-            <h2 className="text-2xl font-bold mb-4">已处理的报销单</h2>
+            <h2 className="text-2xl font-bold mb-4">我处理过的报销单</h2>
             {processedReports.length > 0 ? (
               <div className="space-y-4">
                 {processedReports.map(report => (
