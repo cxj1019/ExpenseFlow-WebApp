@@ -29,16 +29,20 @@ type ReportDetailPageProps = {
   }
 }
 
-// 【已修改】自定义费用类型，以解决类型定义文件可能未同步的问题
+// 自定义费用类型，以解决类型定义文件可能未同步的问题
 type ExpenseWithCustomerName = Expense & {
   customer_name?: string | null;
 };
 type ExpenseInsertWithCustomerName = Database['public']['Tables']['expenses']['Insert'] & {
   customer_name?: string | null;
+  invoice_number?: string | null;
 };
 
 
 const EXPENSE_CATEGORIES = ['飞机', '火车', '长途汽车', 'Taxi', '餐饮', '住宿', '办公用品', '客户招待', '员工福利', '其他'];
+
+// 【已修改】更新为您的 n8n Webhook URL
+const N8N_WEBHOOK_URL = 'http://n8n.19851019.xyz:5678/webhook-test/7e18e6b7-c328-4e17-899c-3188a9b76083';
 
 // ====================================================================
 //  请求书 PDF 模板组件
@@ -392,7 +396,6 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
   const [currentUserProfile, setCurrentUserProfile] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [signedUrls, setSignedUrls] = useState<Record<string, string[]>>({});
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [category, setCategory] = useState(EXPENSE_CATEGORIES[0]);
   const [amount, setAmount] = useState('');
@@ -410,25 +413,13 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
   
   const [editingExpenseId, setEditingExpenseId] = useState<number | null>(null);
   const [editingExpenseData, setEditingExpenseData] = useState<Partial<ExpenseWithCustomerName>>({});
+  
+  const [isRecognizing, setIsRecognizing] = useState(false);
+  const [invoiceNumber, setInvoiceNumber] = useState('');
 
   const supabase = createClientComponentClient<Database>();
   const router = useRouter();
   const reportId = params.id;
-
-  const generateSignedUrls = useCallback(async (expensesToProcess: Expense[]) => {
-    const urls: Record<string, string[]> = {};
-    for (const expense of expensesToProcess) {
-      if (expense.receipt_urls && expense.receipt_urls.length > 0) {
-        const expenseUrls: string[] = [];
-        for (const path of expense.receipt_urls) {
-          const { data } = await supabase.storage.from('receipts').createSignedUrl(path, 60 * 60);
-          if (data) { expenseUrls.push(data.signedUrl); }
-        }
-        urls[expense.id] = expenseUrls;
-      }
-    }
-    setSignedUrls(urls);
-  }, [supabase]);
 
   const fetchPageData = useCallback(async () => {
     setLoading(true);
@@ -472,12 +463,11 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
       setError('加载费用列表失败。');
     } else {
       setExpenses(expensesData);
-      await generateSignedUrls(expensesData);
     }
 
     setCustomers(customersRes.data || []);
     setLoading(false);
-  }, [reportId, supabase, router, generateSignedUrls]);
+  }, [reportId, supabase, router]);
 
   useEffect(() => {
     fetchPageData();
@@ -490,9 +480,78 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
       setIsVatInvoice(false); setTaxRate('');
     }
   }, [category]);
+  
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = error => reject(error);
+    });
+  };
 
-  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
-    setReceiptFiles(e.target.files);
+  const handleInvoiceRecognition = async (file: File) => {
+    if (N8N_WEBHOOK_URL === '在此处粘贴您的 n8n Webhook 生产 URL') {
+      alert('错误：尚未配置 n8n Webhook URL。请在代码中进行设置。');
+      return;
+    }
+    
+    setIsRecognizing(true);
+    try {
+      const base64Data = await fileToBase64(file);
+      
+      const response = await fetch(N8N_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fileData: base64Data,
+          fileType: file.type,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`n8n 工作流返回错误: ${response.statusText}`);
+      }
+
+      // 【已修改】接收并处理 n8n 返回的数据
+      const resultText = await response.text();
+      const result = JSON.parse(resultText); // 解析 Gemini 返回的 JSON 字符串
+
+      console.log('从 n8n 收到的解析结果:', result);
+
+      // 安全地更新状态
+      if (result.category && EXPENSE_CATEGORIES.includes(result.category)) {
+        setCategory(result.category);
+      }
+      if (result.date) {
+        setExpenseDate(result.date);
+      }
+      if (result.amount) {
+        setAmount(String(result.amount));
+      }
+      if (result.invoice_number) {
+        setInvoiceNumber(result.invoice_number);
+      }
+      
+      alert('发票识别成功！请核对信息后保存。');
+
+    } catch (error: any) {
+      console.error("AI 识别请求失败:", error);
+      alert(`AI 识别失败: ${error.message}`);
+    } finally {
+      setIsRecognizing(false);
+    }
+  };
+
+
+  const handleFileChange = async (e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      const files = e.target.files;
+      setReceiptFiles(files);
+      await handleInvoiceRecognition(files[0]);
+    } else {
+      setReceiptFiles(null);
+    }
   };
 
   const handleAddExpense = async (e: FormEvent<HTMLFormElement>) => {
@@ -510,19 +569,41 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
     }
 
     setIsProcessing(true);
-    const receiptPaths: string[] = [];
+    const receiptUrls: string[] = [];
 
     if (receiptFiles && receiptFiles.length > 0) {
       for (const file of Array.from(receiptFiles)) {
-        const fileExt = file.name.split('.').pop();
-        const fileName = `${user.id}-${Date.now()}-${Math.random()}.${fileExt}`;
-        const { error: uploadError } = await supabase.storage.from('receipts').upload(fileName, file);
-        if (uploadError) {
-          alert(`上传文件 ${file.name} 失败: ${uploadError.message}`);
+        try {
+          const presignResponse = await fetch('/api/upload-r2', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ fileType: file.type, userId: user.id }),
+          });
+
+          if (!presignResponse.ok) {
+            const errorBody = await presignResponse.json();
+            throw new Error(errorBody.error || '从服务器获取上传链接失败');
+          }
+
+          const { uploadUrl, accessUrl } = await presignResponse.json();
+
+          const uploadResponse = await fetch(uploadUrl, {
+            method: 'PUT',
+            body: file,
+            headers: { 'Content-Type': file.type },
+          });
+
+          if (!uploadResponse.ok) {
+            throw new Error(`上传文件 ${file.name} 到 R2 失败`);
+          }
+          receiptUrls.push(accessUrl);
+
+        } catch (error: any) {
+          console.error("上传发票时出错:", error);
+          alert(`上传发票时出错: ${error.message}。请检查浏览器控制台和服务器日志获取更多信息。`);
           setIsProcessing(false);
           return;
         }
-        receiptPaths.push(fileName);
       }
     }
 
@@ -534,7 +615,8 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
       expense_date: expenseDate,
       description: description.trim() === '' ? null : description.trim(),
       customer_name: selectedExpenseCustomer.trim() === '' ? null : selectedExpenseCustomer.trim(),
-      receipt_urls: receiptPaths.length > 0 ? receiptPaths : null,
+      invoice_number: invoiceNumber || null,
+      receipt_urls: receiptUrls.length > 0 ? receiptUrls : null,
       is_vat_invoice: isVatInvoice,
       tax_rate: parsedTaxRate,
     };
@@ -551,6 +633,7 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
       setReceiptFiles(null);
       setIsVatInvoice(false);
       setTaxRate('');
+      setInvoiceNumber('');
       const fileInput = document.getElementById('receipt') as HTMLInputElement;
       if (fileInput) fileInput.value = "";
       
@@ -610,12 +693,6 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
       alert('删除费用失败: ' + deleteError.message);
       setIsProcessing(false);
       return;
-    }
-    if (expenseToDelete.receipt_urls && expenseToDelete.receipt_urls.length > 0) {
-      const { error: storageError } = await supabase.storage.from('receipts').remove(expenseToDelete.receipt_urls);
-      if (storageError) {
-        alert('费用记录已删除，但清理关联发票时发生错误: ' + storageError.message);
-      }
     }
     setExpenses(expenses.filter(expense => expense.id !== expenseToDelete.id));
     alert('费用已成功删除！');
@@ -696,12 +773,6 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
       alert('删除报销单失败: ' + deleteReportError.message);
       setIsProcessing(false);
       return;
-    }
-    if (allReceiptPaths.length > 0) {
-      const { error: storageError } = await supabase.storage.from('receipts').remove(allReceiptPaths);
-      if (storageError) {
-        alert('报销单已删除，但清理部分关联发票时出错: ' + storageError.message);
-      }
     }
     alert('报销单已成功删除！');
     router.push('/dashboard');
@@ -918,8 +989,12 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
                     <div className="flex items-center"><input id="isVatInvoice" type="checkbox" checked={isVatInvoice} onChange={e => setIsVatInvoice(e.target.checked)} className="h-4 w-4 text-blue-600 border-gray-300 rounded"/><label htmlFor="isVatInvoice" className="ml-2 block text-sm text-gray-900">增值税专用发票</label></div>
                     {isVatInvoice && (<div><label htmlFor="taxRate" className="block text-sm font-medium text-gray-700">税率 (%)</label><input type="number" id="taxRate" value={taxRate} onChange={e => setTaxRate(e.target.value)} required={isVatInvoice} step="0.01" placeholder="例如: 9 或 6" className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm"/></div>)}
                   </div>
-                  <div><label htmlFor="receipt" className="block text-sm font-medium text-gray-700">上传发票 (可选, 可多选)</label><input type="file" id="receipt" onChange={handleFileChange} accept="image/*" multiple className="mt-1 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"/></div>
-                  <button type="submit" disabled={isProcessing} className="w-full py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400"> {isProcessing ? '正在处理...' : '添加费用'} </button>
+                  <div>
+                    <label htmlFor="receipt" className="block text-sm font-medium text-gray-700">上传发票 (可选, 可多选)</label>
+                    <input type="file" id="receipt" onChange={handleFileChange} accept="image/*" multiple className="mt-1 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"/>
+                    {isRecognizing && <p className="text-sm text-blue-600 mt-2">正在识别发票，请稍候...</p>}
+                  </div>
+                  <button type="submit" disabled={isProcessing || isRecognizing} className="w-full py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400"> {isProcessing ? '正在处理...' : '添加费用'} </button>
                 </form>
               </div>
             </div>
@@ -937,7 +1012,6 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
               <div className="space-y-3">
                 {expenses.length > 0 ? expenses.map(expense => (
                   <div key={expense.id} className="p-3 border rounded-md">
-                  {/* 【已修改】条件渲染：显示表单或静态文本 */}
                   {editingExpenseId === expense.id ? (
                     // --- 编辑表单 ---
                     <div className="space-y-4">
@@ -1017,7 +1091,7 @@ export default function ReportDetailPage({ params }: ReportDetailPageProps) {
                       </div>
                       {expense.receipt_urls && expense.receipt_urls.length > 0 && (
                         <div className="mt-2 pt-2 border-t flex flex-wrap gap-2">
-                          {signedUrls[expense.id]?.map((url, index) => (
+                          {expense.receipt_urls.map((url, index) => (
                             <ImagePreview key={url} src={url}>
                               <a
                                 href={url}
